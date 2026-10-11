@@ -8,6 +8,10 @@ export interface Env {
   ENTITLEMENT_MODE: string;
   GUMROAD_PRODUCT_ID?: string;
   OPENAI_APPS_CHALLENGE?: string;
+  ALLOWED_REDIRECT_HOSTS: string;
+  USER_ID_SECRET: string;
+  SIGNIN_IP_LIMIT: RateLimit;
+  SIGNIN_EMAIL_LIMIT: RateLimit;
   OAUTH_PROVIDER: import("@cloudflare/workers-oauth-provider").OAuthHelpers;
 }
 
@@ -43,6 +47,11 @@ export class AllowlistEntitlement implements Entitlement {
     const record = await this.kv.get<{ keyHash: string; active: boolean }>(`customer:${address}`, "json");
     if (!record || !record.active) return { ok: false };
     return sameString(record.keyHash, await sha256(key.trim())) ? { ok: true, email: address } : { ok: false };
+  }
+  // Re-check with the stored hash, so grants never hold the plain access key.
+  async checkHash(email: string, keyHash: string): Promise<boolean> {
+    const record = await this.kv.get<{ keyHash: string; active: boolean }>(`customer:${normalizeEmail(email)}`, "json");
+    return !!record?.active && sameString(record.keyHash, keyHash);
   }
 }
 
@@ -98,9 +107,15 @@ export function entitlementFor(env: Env): Entitlement {
 // without calling the store on every tool call.
 const RECHECK_SECONDS = 600;
 
+// What a grant keeps for re-checks: the key hash in allowlist mode, the license key for Gumroad.
+export async function grantSecret(env: Env, key: string): Promise<string> {
+  return env.ENTITLEMENT_MODE === "gumroad" ? key : sha256(key.trim());
+}
+
 export async function stillEntitled(env: Env, email: string, key: string): Promise<boolean> {
-  // The allowlist is one KV read, so it is checked live: a revocation applies at once.
-  if (env.ENTITLEMENT_MODE !== "gumroad") return (await entitlementFor(env).check(email, key)).ok;
+  // The allowlist is one KV read, so it is checked on every call (KV edge reads can lag
+  // a write by up to about a minute).
+  if (env.ENTITLEMENT_MODE !== "gumroad") return new AllowlistEntitlement(env.ENTITLEMENTS).checkHash(email, key);
   const cacheKey = `check:${await sha256(`${env.ENTITLEMENT_MODE}\n${normalizeEmail(email)}\n${key}`)}`;
   if ((await env.ENTITLEMENTS.get(cacheKey)) === "ok") return true;
   const verdict = await entitlementFor(env).check(email, key);
@@ -108,17 +123,20 @@ export async function stillEntitled(env: Env, email: string, key: string): Promi
   return verdict.ok;
 }
 
-// Slow down key guessing: at most MAX_FAILURES failed sign-ins per email per window.
-const MAX_FAILURES = 5;
-const WINDOW_SECONDS = 900;
-
-export async function tooManyFailures(env: Env, email: string): Promise<boolean> {
-  const count = Number((await env.ENTITLEMENTS.get(`fail:${normalizeEmail(email)}`)) ?? "0");
-  return count >= MAX_FAILURES;
+// Slow down key guessing: Workers rate-limiting bindings count atomically per location.
+export async function signInAllowed(env: Env, ip: string, email: string): Promise<boolean> {
+  const [byIp, byEmail] = await Promise.all([
+    env.SIGNIN_IP_LIMIT.limit({ key: `ip:${ip}` }),
+    env.SIGNIN_EMAIL_LIMIT.limit({ key: `email:${normalizeEmail(email)}` }),
+  ]);
+  return byIp.success && byEmail.success;
 }
 
-export async function recordFailure(env: Env, email: string): Promise<void> {
-  const key = `fail:${normalizeEmail(email)}`;
-  const count = Number((await env.ENTITLEMENTS.get(key)) ?? "0");
-  await env.ENTITLEMENTS.put(key, String(count + 1), { expirationTtl: WINDOW_SECONDS });
+// Stable per-customer ID for grants. Codes and tokens embed it, so it is keyed with a secret:
+// a guessed email cannot be confirmed from a code.
+export async function userIdFor(env: Env, email: string): Promise<string> {
+  if (!env.USER_ID_SECRET || env.USER_ID_SECRET.length < 32) throw new Error("USER_ID_SECRET (32+ characters) is required");
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.USER_ID_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(normalizeEmail(email)));
+  return [...new Uint8Array(mac)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
 }

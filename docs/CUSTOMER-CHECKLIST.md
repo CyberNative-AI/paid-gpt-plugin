@@ -10,8 +10,8 @@ guide (read 2026-10-11). **UNKNOWN** means OpenAI has not published an answer.
 - [ ] **Your method.** The GPT instructions are served by the `get_playbook` tool after sign-in.
 - [ ] **Your knowledge files** (.md or .txt), searchable with `search_knowledge` and readable
       with `read_document`. Convert PDFs and DOCX to text first and check the result.
-- [ ] **Your control.** Refunds and revocations apply on the next tool call (allowlist) or
-      within 10 minutes (Gumroad).
+- [ ] **Your control.** Refunds and revocations apply within about a minute (allowlist) or
+      about 10 minutes (Gumroad).
 
 ## Loses
 - [ ] **Conversation history with the GPT.** OpenAI: "previous chats may not copy". Tell

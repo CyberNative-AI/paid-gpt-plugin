@@ -1,6 +1,6 @@
 import { AuthorizationError, CimdFetchError, OAuthProvider, type ConsentDescription } from "@cloudflare/workers-oauth-provider";
 import { CONTENT } from "./content";
-import { entitlementFor, normalizeEmail, recordFailure, tooManyFailures, sha256, type Env, type Verdict } from "./entitlement";
+import { entitlementFor, grantSecret, normalizeEmail, signInAllowed, userIdFor, type Env, type Verdict } from "./entitlement";
 import { McpApiHandler, type Props } from "./mcp";
 
 const escape = (value: string) => value.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -37,12 +37,19 @@ ${message ? `<p class="error" role="alert">${escape(message)}</p>` : ""}
 </html>`;
 }
 
-const frameHeaders = () => new Headers({ "X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'" });
-
 const html = (body: string, headers: Headers, status = 200) => {
   headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set("Cache-Control", "no-store");
   return new Response(body, { status, headers });
 };
+
+const TOO_MANY = "Too many sign-in attempts. Wait a minute and try again.";
+const UNAVAILABLE = "The purchase check is unavailable right now. Try again in a few minutes.";
+
+function redirectAllowed(env: Env, redirectUri: string): boolean {
+  const host = new URL(redirectUri).hostname;
+  return env.ALLOWED_REDIRECT_HOSTS.split(",").map((h) => h.trim()).filter(Boolean).includes(host);
+}
 
 const authorizePage = {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -53,9 +60,12 @@ const authorizePage = {
       return new Response(env.OPENAI_APPS_CHALLENGE, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     if (url.pathname !== "/authorize") return new Response("Not found", { status: 404 });
     const oauth = env.OAUTH_PROVIDER;
+    const plain = (message: string, status: number) =>
+      new Response(message, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
     try {
       if (request.method === "GET") {
         const authRequest = await oauth.parseAuthRequest(request);
+        if (!redirectAllowed(env, authRequest.redirectUri)) return plain("This app can't sign in here.", 400);
         const details = await oauth.describeConsent(authRequest);
         const consent = await oauth.beginConsent(authRequest);
         return html(signInPage(env, details, consent.handle), consent.headers);
@@ -67,29 +77,32 @@ const authorizePage = {
         const denied = await oauth.denyConsent(request, handle);
         return new Response(null, { status: 302, headers: denied.headers });
       }
+      // Validate (and consume) the browser-bound consent handle before looking at the key,
+      // so a forged form learns nothing and costs one rate-limit slot.
+      const approved = await oauth.approveConsent(request, handle, { scope: ["content:read"] });
       const email = normalizeEmail(String(form.get("email") ?? ""));
       const key = String(form.get("key") ?? "").trim();
+      const retry = async (message: string, status: number) => {
+        // Start a fresh consent transaction for the same validated request and show the form again.
+        const again = await oauth.beginConsent(approved.request);
+        for (const cookie of approved.headers.getSetCookie()) again.headers.append("Set-Cookie", cookie);
+        const details = await oauth.describeConsent(approved.request);
+        return html(signInPage(env, details, again.handle, message, email), again.headers, status);
+      };
+      if (!email || !key) return retry(NOT_FOUND, 401);
+      const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+      if (!(await signInAllowed(env, ip, email))) return retry(TOO_MANY, 429);
       let verdict: Verdict;
       try {
-        verdict = email && key && !(await tooManyFailures(env, email)) ? await entitlementFor(env).check(email, key) : { ok: false };
+        verdict = await entitlementFor(env).check(email, key);
       } catch {
-        const authRequest = await oauth.parseAuthRequest(new Request(request.url, { headers: request.headers }));
-        const details = await oauth.describeConsent(authRequest);
-        return html(signInPage(env, details, handle, "The purchase check is unavailable right now. Try again in a few minutes.", email), frameHeaders(), 503);
+        return retry(UNAVAILABLE, 503);
       }
-      if (!verdict.ok) {
-        if (email) await recordFailure(env, email);
-        // Same page, same handle: the consent transaction is only consumed on approve or deny.
-        const authRequest = await oauth.parseAuthRequest(new Request(request.url, { headers: request.headers }));
-        const details = await oauth.describeConsent(authRequest);
-        return html(signInPage(env, details, handle, NOT_FOUND, email), frameHeaders(), 401);
-      }
-      const approved = await oauth.approveConsent(request, handle, { scope: ["content:read"] });
-      const props: Props = { email: verdict.email, key };
+      if (!verdict.ok) return retry(NOT_FOUND, 401);
+      const props: Props = { email: verdict.email, key: await grantSecret(env, key) };
       const { redirectTo } = await oauth.completeAuthorization({
         request: approved.request,
-        // Codes and tokens embed userId, so use a hash: the email never appears in redirect URLs.
-        userId: (await sha256(verdict.email)).slice(0, 32),
+        userId: await userIdFor(env, verdict.email),
         metadata: {},
         scope: ["content:read"],
         props,
@@ -100,7 +113,7 @@ const authorizePage = {
       if (error instanceof AuthorizationError && error.redirectTo) return Response.redirect(error.redirectTo, 302);
       if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
         const message = error instanceof AuthorizationError ? error.description : "This app could not be verified.";
-        return new Response(message ?? "Sign-in request is not valid.", { status: 400, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+        return plain(message ?? "Sign-in request is not valid.", 400);
       }
       throw error;
     }

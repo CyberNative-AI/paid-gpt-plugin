@@ -41,7 +41,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        doc: { type: "string", enum: CONTENT.documents.map((d) => d.id), description: "Document ID." },
+        doc: { type: "string", description: "Document ID, as shown in search_knowledge results." },
         section: { type: "string", description: "Optional section heading." },
       },
       required: ["doc"],
@@ -79,6 +79,10 @@ const reply = (id: Rpc["id"], result: unknown) => ({ jsonrpc: "2.0", id, result 
 const fail = (id: Rpc["id"], code: number, message: string) => ({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
 
 async function handle(msg: Rpc, env: Env, props: Props) {
+  if (typeof msg !== "object" || msg === null || Array.isArray(msg) || typeof msg.method !== "string")
+    return fail(null, -32600, "Invalid request");
+  // Notifications (no id) never get a response, and never run tools.
+  if (msg.id === undefined) return null;
   switch (msg.method) {
     case "initialize": {
       const asked = msg.params?.protocolVersion;
@@ -108,7 +112,7 @@ async function handle(msg: Rpc, env: Env, props: Props) {
       return reply(msg.id, callTool(name, msg.params?.arguments ?? {}));
     }
     default:
-      return msg.id === undefined ? null : fail(msg.id, -32601, `Method not found: ${msg.method}`);
+      return fail(msg.id, -32601, `Method not found: ${msg.method}`);
   }
 }
 
@@ -123,6 +127,7 @@ export const McpApiHandler = {
       return Response.json(fail(null, -32700, "Parse error"), { status: 400 });
     }
     const batch = Array.isArray(body) ? body : [body];
+    if (!batch.length) return Response.json(fail(null, -32600, "Invalid request"), { status: 400 });
     const out = (await Promise.all(batch.map((m) => handle(m, env, ctx.props)))).filter((r) => r !== null);
     if (!out.length) return new Response(null, { status: 202 });
     return Response.json(Array.isArray(body) ? out : out[0]);

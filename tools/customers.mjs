@@ -27,6 +27,8 @@ function wrangler(...rest) {
   execFileSync("npx", ["wrangler", "kv", "key", ...rest, "--binding", "ENTITLEMENTS", local ? "--local" : "--remote"], { stdio: ["ignore", "ignore", "inherit"] });
 }
 function add(email, key = newKey()) {
+  // Keys are the only secret a customer has: refuse short hand-picked ones.
+  if (key.replace(/[^A-Za-z0-9]/g, "").length < 16) throw new Error("access keys need at least 16 letters or digits; omit --key to generate one");
   wrangler("put", `customer:${norm(email)}`, JSON.stringify({ keyHash: hash(key), active: true }));
   return key;
 }

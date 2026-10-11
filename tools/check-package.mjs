@@ -22,25 +22,55 @@ execFileSync("unzip", ["-qq", zip, "-d", dir]);
 const files = [];
 const walk = (d) => readdirSync(d).forEach((f) => (statSync(join(d, f)).isDirectory() ? walk(join(d, f)) : files.push(join(d, f))));
 walk(dir);
-const zipText = files.map((f) => readFileSync(f, "utf8")).join("\n").toLowerCase().replace(/\s+/g, " ");
+const rel = (f) => f.slice(dir.length + 1);
 
-// 1. Leak check: every 8-word window of the playbook and every knowledge chunk.
-const content = JSON.parse(readFileSync(join(root, "src/generated/content.json"), "utf8"));
-const words = (t) => t.toLowerCase().replace(/\s+/g, " ").split(" ").filter(Boolean);
-let windows = 0, leaks = [];
-for (const source of [content.playbook, ...content.chunks.map((c) => c.text)]) {
-  const w = words(source);
-  for (let i = 0; i + 8 <= w.length; i++) {
-    windows++;
-    const phrase = w.slice(i, i + 8).join(" ");
-    if (zipText.includes(phrase)) leaks.push(phrase);
+// 1. Leak check. Only plain package files are allowed, so content can't hide in an
+// archive, an encoding or a data: URI; text is compared as word tokens, ignoring markup,
+// JSON escapes and punctuation.
+const TEXT = [".json", ".md", ".svg"];
+const IMAGE = { ".png": [0x89, 0x50, 0x4e, 0x47], ".jpg": [0xff, 0xd8], ".jpeg": [0xff, 0xd8], ".webp": [0x52, 0x49, 0x46, 0x46] };
+const tokens = (t) => t.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+const strings = (v) => (typeof v === "string" ? [v] : v && typeof v === "object" ? Object.values(v).flatMap(strings) : []);
+const unmark = (t) => t.replace(/<[^>]*>/g, " ").replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16))).replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d))).replace(/&[a-z]+;/gi, " ");
+const haystack = [];
+for (const f of files) {
+  const name = rel(f);
+  const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
+  const bytes = readFileSync(f);
+  haystack.push(name);
+  need(!(bytes[0] === 0x50 && bytes[1] === 0x4b) && !(bytes[0] === 0x1f && bytes[1] === 0x8b), `${name}: not an archive`);
+  if (TEXT.includes(ext)) {
+    let text = "";
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { need(false, `${name}: valid UTF-8`); continue; }
+    need(!/data:/i.test(text), `${name}: no data: URIs`);
+    need(!/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text), `${name}: no control characters (e.g. UTF-16 text)`);
+    haystack.push(text, unmark(text));
+    if (ext === ".json") { try { haystack.push(...strings(JSON.parse(text))); } catch { need(false, `${name}: valid JSON`); } }
+  } else if (IMAGE[ext]) {
+    need(IMAGE[ext].every((b, k) => bytes[k] === b), `${name}: is a real ${ext} image`);
+    haystack.push(bytes.toString("latin1"));
+  } else {
+    need(false, `${name}: allowed file type (${[...TEXT, ...Object.keys(IMAGE)].join(" ")})`);
   }
 }
-need(windows > 0 && leaks.length === 0, `no instructions or knowledge text in ZIP (${windows} 8-word windows checked, ${leaks.length} found)`);
+const zipTokens = ` ${haystack.map((t) => tokens(t).join(" ")).join(" | ")} `;
+
+const content = JSON.parse(readFileSync(join(root, "src/generated/content.json"), "utf8"));
+let windows = 0, leaks = [];
+for (const source of [content.playbook, ...content.chunks.map((c) => c.text)]) {
+  const w = tokens(source);
+  // Passages shorter than 8 words are checked whole when they have at least 4 words.
+  const size = w.length >= 8 ? 8 : w.length >= 4 ? w.length : 0;
+  for (let k = 0; size && k + size <= w.length; k++) {
+    windows++;
+    const phrase = w.slice(k, k + size).join(" ");
+    if (zipTokens.includes(` ${phrase} `)) leaks.push(phrase);
+  }
+}
+need(windows > 0 && leaks.length === 0, `no instructions or knowledge text in ZIP (${windows} word windows checked, ${leaks.length} found)`);
 if (leaks.length) console.log("leaked:", leaks.slice(0, 5));
 
 // 2. Manifest.
-const rel = (f) => f.slice(dir.length + 1);
 const manifest = JSON.parse(readFileSync(join(dir, "plugin.json"), "utf8"));
 const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
 const oa = manifest.extensions?.["com.openai"] ?? {};

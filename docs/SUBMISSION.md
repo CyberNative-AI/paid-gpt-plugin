@@ -24,6 +24,7 @@ already provides.
 npx wrangler kv namespace create OAUTH_KV        # put the id in wrangler.jsonc
 npx wrangler kv namespace create ENTITLEMENTS    # put the id in wrangler.jsonc
 # set PUBLIC_ORIGIN to your HTTPS origin and mcpURL in gpt.json to <origin>/mcp
+npx wrangler secret put USER_ID_SECRET            # 32+ random characters
 node tools/convert.mjs path/to/your-gpt
 node tools/check-package.mjs build/<slug>-plugin.zip
 npx wrangler deploy

@@ -40,15 +40,18 @@ node tools/convert.mjs my-gpt                 # Worker content + build/plugin/<s
 node tools/check-package.mjs build/<slug>-plugin.zip
 ```
 
-`check-package` fails if any 8-word passage of your instructions or knowledge is in the ZIP,
-and checks the manifest against OpenAI's published submission limits.
+`check-package` fails if any 8-word passage of your instructions or knowledge is in the ZIP
+(compared as words, ignoring markup, JSON escapes and punctuation). It allows only plain
+`.json`/`.md`/`.svg` and real image files, with no archives, `data:` URIs or UTF-16 text. It also
+checks the manifest against OpenAI's published submission limits.
 
 ## Who gets in
 
 Set `ENTITLEMENT_MODE` in `wrangler.jsonc`:
 
 - **`allowlist`** (default): you issue each customer an access key. Keys are stored only as
-  SHA-256 hashes in KV. Revocation applies on the next tool call.
+  SHA-256 hashes in KV (at least 16 letters or digits). Revocation applies on the next tool
+  call once the KV write has propagated, usually within a minute.
   ```sh
   node tools/customers.mjs import customers.csv   # prints email,key for each customer
   node tools/customers.mjs revoke someone@example.com
@@ -58,6 +61,10 @@ Set `ENTITLEMENT_MODE` in `wrangler.jsonc`:
   access until it ends. Results are cached for 10 minutes. Set `GUMROAD_PRODUCT_ID`.
 
 Other stores fit the `Entitlement` interface in [`src/entitlement.ts`](src/entitlement.ts).
+
+Set the `USER_ID_SECRET` secret (32+ random characters) before deploying; grants are keyed by
+an HMAC of the email, so codes and tokens never reveal it. Only `ALLOWED_REDIRECT_HOSTS`
+(ChatGPT and loopback by default) can receive sign-in codes.
 
 The reviewer account is an ordinary allowlist entry, so OpenAI's reviewers can sign in
 without MFA, magic links or email codes, as review requires.
@@ -71,8 +78,10 @@ npm run typecheck
 
 The end-to-end test runs against local workerd with the official MCP SDK client. It covers
 discovery from the 401, dynamic client registration, PKCE, sign-in, the `iss` response
-parameter, token exchange, all three tools, a wrong key, an unknown email, revocation after
-sign-in, and the reviewer account.
+parameter, token exchange, all three tools, a wrong key, an unknown email, a mistyped key
+retried, revocation after sign-in, the reviewer account, forged sign-in forms, notifications,
+malformed batches, a disallowed redirect host and the per-email throttle. The package check
+runs against eight planted-leak controls.
 
 ## Publish
 
@@ -88,7 +97,9 @@ template covers. Tell customers what changes with [docs/CUSTOMER-CHECKLIST.md](d
 - **Custom actions are not converted.**
 - **The Gumroad adapter is tested against Gumroad's open-source verify endpoint**, with mocked
   responses, not a live store.
-- **Sign-in throttling is basic**: 5 failures per email per 15 minutes, in eventually consistent KV.
+- **Sign-in throttling** uses Cloudflare's rate-limiting binding: 20 attempts per IP and 5 per
+  email per minute, counted per Cloudflare location. Someone who knows a customer's email can
+  keep that customer's sign-in throttled while they keep trying.
 
 ## License
 

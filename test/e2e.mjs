@@ -3,6 +3,7 @@
 // library MCP Inspector uses. Run through test/run.mjs, which starts the server and seeds customers.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -20,10 +21,13 @@ const check = async (name, fn) => {
 
 // wrangler dev closes idle keep-alive sockets after a few seconds; retry once when a pooled
 // socket was already closed ("other side closed"), as a browser or ChatGPT would reconnect.
+// Applied globally because the SDK's OAuth requests use the global fetch.
+const nativeFetch = globalThis.fetch;
 const retryingFetch = async (url, init) => {
-  try { return await fetch(url, init); }
-  catch (e) { if (e.cause?.code === "UND_ERR_SOCKET") return fetch(url, init); throw e; }
+  try { return await nativeFetch(url, init); }
+  catch (e) { if (e.cause?.code === "UND_ERR_SOCKET") return nativeFetch(url, init); throw e; }
 };
+globalThis.fetch = retryingFetch;
 
 class MemoryProvider {
   constructor() { this.store = {}; this.lastAuthUrl = null; }
@@ -67,7 +71,9 @@ async function connect(email, key) {
   if (result.status !== 302) return { provider, result };
   const back = new URL(result.location);
   assert.equal(back.searchParams.get("iss"), BASE, "RFC 9207 iss returned");
-  assert.ok(!decodeURIComponent(back.searchParams.get("code")).toLowerCase().includes(email.toLowerCase()), "authorization code does not carry the email");
+  const code = decodeURIComponent(back.searchParams.get("code")).toLowerCase();
+  assert.ok(!code.includes(email.toLowerCase()), "authorization code does not carry the email");
+  assert.ok(!code.startsWith(createHash("sha256").update(email.toLowerCase()).digest("hex").slice(0, 16)), "nor an unsalted email hash");
   await transport.finishAuth(back.searchParams.get("code"));
   transport = new StreamableHTTPClientTransport(MCP, { authProvider: provider, fetch: retryingFetch });
   const authed = new Client({ name: "e2e", version: "1.0.0" });
@@ -92,7 +98,7 @@ await check("unauthenticated MCP request gets 401 with resource metadata", async
 });
 
 await check("entitled customer: DCR + PKCE + sign-in + token exchange + MCP connect", async () => {
-  customer = await connect("Buyer@Example.com", "TEST-KEY-0001");
+  customer = await connect("Buyer@Example.com", "TEST-KEY-0001-AAAA-BBBB");
   assert.equal(customer.result.status, 302, `sign-in redirected (got ${customer.result.status})`);
   assert.ok(customer.client, "connected");
 });
@@ -121,8 +127,8 @@ await check("entitled customer: read_document returns one section verbatim", asy
 });
 
 for (const [label, email, key] of [
-  ["wrong key", "buyer@example.com", "TEST-KEY-9999"],
-  ["unknown email", "stranger@example.com", "TEST-KEY-0001"],
+  ["wrong key", "buyer@example.com", "TEST-KEY-9999-AAAA-BBBB"],
+  ["unknown email", "stranger@example.com", "TEST-KEY-0001-AAAA-BBBB"],
 ]) {
   await check(`non-entitled (${label}): no token, neutral message, no content, no upsell`, async () => {
     const { result, client } = await connect(email, key);
@@ -147,11 +153,73 @@ await check("revoked after sign-in: next tool call is denied neutrally with a re
 });
 
 await check("reviewer-style account signs in with email + key only (no MFA, magic link or email code)", async () => {
-  execFileSync("node", ["tools/customers.mjs", "add", "reviewer@example.com", "--key", "REVIEW-KEY-0001", "--local"], { stdio: "ignore" });
-  const r = await connect("reviewer@example.com", "REVIEW-KEY-0001");
+  execFileSync("node", ["tools/customers.mjs", "add", "reviewer@example.com", "--key", "REVIEW-KEY-0001-AAAA-BBBB", "--local"], { stdio: "ignore" });
+  const r = await connect("reviewer@example.com", "REVIEW-KEY-0001-AAAA-BBBB");
   assert.equal(r.result.status, 302);
   const tools = await r.client.listTools();
   assert.equal(tools.tools.length, 3);
+});
+
+const rpc = (token, body) => retryingFetch(MCP, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+
+await check("a customer who mistypes the key can retry on the re-shown form and get in", async () => {
+  const provider = new MemoryProvider();
+  const transport = new StreamableHTTPClientTransport(MCP, { authProvider: provider, fetch: retryingFetch });
+  await assert.rejects(new Client({ name: "e2e", version: "1.0.0" }).connect(transport), UnauthorizedError);
+  const authUrl = provider.lastAuthUrl;
+  const jar = new Map();
+  const keep = (r) => r.headers.getSetCookie().forEach((c) => { const [kv] = c.split(";"); const [k, v] = kv.split("="); v ? jar.set(k, v) : jar.delete(k); });
+  const cookie = () => [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+  const page = await fetch(authUrl, { redirect: "manual" }); keep(page);
+  let handle = (await page.text()).match(/name="handle" value="([^"]+)"/)[1];
+  const post = (key) => fetch(authUrl, { method: "POST", redirect: "manual", headers: { cookie: cookie(), "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ handle, email: "reviewer@example.com", key, decision: "approve" }) });
+  const wrong = await post("REVIEW-KEY-0001-XXXX-BBBB"); keep(wrong);
+  assert.equal(wrong.status, 401);
+  handle = (await wrong.text()).match(/name="handle" value="([^"]+)"/)[1];
+  const right = await post("REVIEW-KEY-0001-AAAA-BBBB");
+  assert.equal(right.status, 302);
+  assert.ok(new URL(right.headers.get("location")).searchParams.get("code"));
+});
+
+await check("forged form (no consent cookie, made-up handle) gets the same 400 for a right or wrong key", async () => {
+  const authUrl = new URL(customer.provider.lastAuthUrl ?? "http://x");
+  const post = (key) => fetch(new URL("/authorize?" + authUrl.searchParams, BASE), {
+    method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ handle: "bogus", email: "reviewer@example.com", key, decision: "approve" }),
+  });
+  const [right, wrong] = await Promise.all([post("REVIEW-KEY-0001-AAAA-BBBB"), post("WRONG-KEY-0001-AAAA-BBBB")]);
+  assert.equal(right.status, 400);
+  assert.equal(wrong.status, 400);
+  assert.equal(await right.text(), await wrong.text());
+});
+
+await check("notifications get no response and run nothing; malformed batch entries are rejected", async () => {
+  const token = (await (async () => { const r = await connect("reviewer@example.com", "REVIEW-KEY-0001-AAAA-BBBB"); return r.provider.store.tokens.access_token; })());
+  const note = await rpc(token, { jsonrpc: "2.0", method: "tools/call", params: { name: "get_playbook", arguments: {} } });
+  assert.equal(note.status, 202);
+  assert.equal(await note.text(), "");
+  const bad = await rpc(token, [null]);
+  assert.equal(bad.status, 200);
+  assert.equal((await bad.json())[0].error.code, -32600);
+  const list = await (await rpc(token, { jsonrpc: "2.0", id: 1, method: "tools/list" })).json();
+  const listed = JSON.stringify(list);
+  for (const d of content.documents) assert.ok(!listed.includes(d.id), `tools/list does not name document ${d.id}`);
+});
+
+await check("redirect to a host outside ALLOWED_REDIRECT_HOSTS is refused before sign-in", async () => {
+  const reg = await (await fetch(new URL("/oauth/register", BASE), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: ["https://evil.example/cb"], token_endpoint_auth_method: "none" }) })).json();
+  const u = new URL("/authorize", BASE);
+  Object.entries({ response_type: "code", client_id: reg.client_id, redirect_uri: "https://evil.example/cb", code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", code_challenge_method: "S256", state: "s", scope: "content:read", resource: MCP.href }).forEach(([k, v]) => u.searchParams.set(k, v));
+  const r = await fetch(u, { redirect: "manual" });
+  assert.equal(r.status, 400);
+  assert.doesNotMatch(await r.text(), /<form/);
+});
+
+await check("per-email throttle: the 6th attempt in a minute gets 'too many attempts' (429), not 'no match'", async () => {
+  let last;
+  for (let i = 0; i < 6; i++) last = await connect("throttle@example.com", `WRONG-KEY-${i}-AAAAAAAA`);
+  assert.equal(last.result.status, 429);
+  assert.match(last.result.body, /Too many sign-in attempts/);
 });
 
 const failed = results.filter(([s]) => s === "FAIL").length;
