@@ -1,0 +1,23 @@
+{
+  // One Worker: OAuth authorization server, sign-in page and the gated MCP endpoint.
+  "name": "paid-gpt-plugin",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "kv_namespaces": [
+    // Tokens, grants and registered clients (managed by @cloudflare/workers-oauth-provider).
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" },
+    // Your customer list and short-lived entitlement checks.
+    { "binding": "ENTITLEMENTS", "id": "REPLACE_WITH_KV_ID" }
+  ],
+  "vars": {
+    // The public HTTPS origin of this Worker, without a trailing slash.
+    "PUBLIC_ORIGIN": "http://localhost:8787",
+    // "allowlist" (you issue access keys) or "gumroad" (customers use their Gumroad license key).
+    "ENTITLEMENT_MODE": "allowlist",
+    // Required for gumroad mode: the product ID from your Gumroad product page.
+    "GUMROAD_PRODUCT_ID": "",
+    // Domain verification token shown in the plugin dashboard (served at /.well-known/openai-apps-challenge).
+    "OPENAI_APPS_CHALLENGE": ""
+  }
+}

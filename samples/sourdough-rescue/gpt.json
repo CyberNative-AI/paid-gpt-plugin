@@ -1,0 +1,29 @@
+{
+  "slug": "sourdough-rescue",
+  "name": "Sourdough Rescue Coach",
+  "shortDescription": "Fix failed sourdough loaves",
+  "description": "Diagnoses why a home sourdough loaf failed from a description or photo notes, then gives a corrected schedule for the next bake. For home bakers who bought Sourdough Rescue Coach from Crumb & Crust Studio. Requires signing in with the email and access key from that purchase. It does not give medical or food-safety advice beyond basic hygiene.",
+  "creator": "Crumb & Crust Studio",
+  "creatorEmail": "help@crumbandcrust.example",
+  "category": "Lifestyle",
+  "capabilities": ["Diagnose a failed loaf", "Plan the next bake", "Look up the troubleshooting guide"],
+  "conversationStarters": [
+    "My loaf came out flat and gummy. What went wrong?",
+    "Plan a weekend bake around a 9am Saturday start.",
+    "Why is my starter not doubling anymore?"
+  ],
+  "websiteURL": "https://crumbandcrust.example/rescue-coach",
+  "supportURL": "https://crumbandcrust.example/support",
+  "privacyPolicyURL": "https://crumbandcrust.example/privacy",
+  "termsOfServiceURL": "https://crumbandcrust.example/terms",
+  "mcpURL": "https://rescue-coach.crumbandcrust.example/mcp",
+  "brandColor": "#8A4B12",
+  "countries": [],
+  "reviewCases": [
+    { "description": "Diagnose a flat, gummy loaf", "prompt": "My loaf came out flat and gummy inside. 75% hydration, bulk 4 hours at 20C.", "tools": "get_playbook, search_knowledge", "expected": "Asks at most one clarifying question or names underproofing as the likely cause, citing the troubleshooting guide, and gives a corrected bulk time." },
+    { "description": "Plan a bake schedule", "prompt": "Plan a weekend bake around a 9am Saturday start, kitchen at 22C.", "tools": "get_playbook, search_knowledge", "expected": "Returns a timed schedule from feeding to bake with temperatures from the schedules document." },
+    { "description": "Weak starter", "prompt": "Why is my starter not doubling anymore?", "tools": "get_playbook, search_knowledge", "expected": "Lists the starter causes from the guide in order of likelihood and a 3-day recovery routine." },
+    { "description": "Read one section", "prompt": "Show me the full section on dense crumb from the troubleshooting guide.", "tools": "read_document", "expected": "Returns the Dense, tight crumb section of the troubleshooting matrix verbatim." },
+    { "description": "No matching material", "prompt": "What does the guide say about gluten-free baguettes?", "tools": "search_knowledge", "expected": "Says the reference documents do not cover gluten-free baguettes and does not invent guidance." }
+  ]
+}

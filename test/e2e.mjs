@@ -1,0 +1,159 @@
+// End to end against local workerd (wrangler dev): OAuth discovery, DCR, PKCE, sign-in,
+// token exchange and MCP tool calls through the official MCP SDK client, the same client
+// library MCP Inspector uses. Run through test/run.mjs, which starts the server and seeds customers.
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+
+const BASE = process.env.BASE ?? "http://localhost:8787";
+const MCP = new URL("/mcp", BASE);
+const REDIRECT = "http://localhost:9/callback";
+const content = JSON.parse(readFileSync(new URL("../src/generated/content.json", import.meta.url), "utf8"));
+const results = [];
+const check = async (name, fn) => {
+  try { await fn(); results.push(["PASS", name]); console.log(`PASS ${name}`); }
+  catch (e) { results.push(["FAIL", name]); console.log(`FAIL ${name}\n  ${e.stack ?? e}\n  cause: ${e.cause?.stack ?? e.cause}`); }
+};
+
+// wrangler dev closes idle keep-alive sockets after a few seconds; retry once when a pooled
+// socket was already closed ("other side closed"), as a browser or ChatGPT would reconnect.
+const retryingFetch = async (url, init) => {
+  try { return await fetch(url, init); }
+  catch (e) { if (e.cause?.code === "UND_ERR_SOCKET") return fetch(url, init); throw e; }
+};
+
+class MemoryProvider {
+  constructor() { this.store = {}; this.lastAuthUrl = null; }
+  get redirectUrl() { return REDIRECT; }
+  get clientMetadata() { return { client_name: "e2e test client", redirect_uris: [REDIRECT], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" }; }
+  clientInformation() { return this.store.client; }
+  saveClientInformation(c) { this.store.client = c; }
+  tokens() { return this.store.tokens; }
+  saveTokens(t) { this.store.tokens = t; }
+  redirectToAuthorization(url) { this.lastAuthUrl = url; }
+  saveCodeVerifier(v) { this.store.verifier = v; }
+  codeVerifier() { return this.store.verifier; }
+}
+
+// Plays the customer's browser on the sign-in page.
+async function signIn(authUrl, email, key) {
+  const page = await fetch(authUrl, { redirect: "manual" });
+  assert.equal(page.status, 200, "sign-in page loads");
+  const cookie = page.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+  const html = await page.text();
+  const handle = html.match(/name="handle" value="([^"]+)"/)[1];
+  const post = await fetch(authUrl, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded", origin: BASE },
+    body: new URLSearchParams({ handle, email, key, decision: "approve" }),
+  });
+  return { page: html, status: post.status, location: post.headers.get("location"), body: await post.text() };
+}
+
+async function connect(email, key) {
+  const provider = new MemoryProvider();
+  let transport = new StreamableHTTPClientTransport(MCP, { authProvider: provider, fetch: retryingFetch });
+  const client = new Client({ name: "e2e", version: "1.0.0" });
+  await assert.rejects(client.connect(transport), UnauthorizedError, "first connect needs sign-in");
+  assert.ok(provider.store.client?.client_id, "dynamic client registration returned a client_id");
+  const authUrl = provider.lastAuthUrl;
+  assert.equal(authUrl.searchParams.get("code_challenge_method"), "S256");
+  assert.equal(authUrl.searchParams.get("resource"), MCP.href);
+  const result = await signIn(authUrl, email, key);
+  if (result.status !== 302) return { provider, result };
+  const back = new URL(result.location);
+  assert.equal(back.searchParams.get("iss"), BASE, "RFC 9207 iss returned");
+  assert.ok(!decodeURIComponent(back.searchParams.get("code")).toLowerCase().includes(email.toLowerCase()), "authorization code does not carry the email");
+  await transport.finishAuth(back.searchParams.get("code"));
+  transport = new StreamableHTTPClientTransport(MCP, { authProvider: provider, fetch: retryingFetch });
+  const authed = new Client({ name: "e2e", version: "1.0.0" });
+  await authed.connect(transport);
+  return { provider, result, client: authed };
+}
+
+const UPSELL = /\b(buy|purchase now|subscribe|subscription plan|upgrade|pricing|price|trial|discount|checkout)\b|\$\d/i;
+const textOf = (r) => r.content.map((c) => c.text).join("\n");
+
+let customer;
+await check("domain verification token served as exact plain text", async () => {
+  const r = await fetch(new URL("/.well-known/openai-apps-challenge", BASE));
+  assert.equal(r.status, 200);
+  assert.equal(await r.text(), "challenge-token-123");
+});
+
+await check("unauthenticated MCP request gets 401 with resource metadata", async () => {
+  const r = await fetch(MCP, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  assert.equal(r.status, 401);
+  assert.match(r.headers.get("www-authenticate"), /resource_metadata="http:\/\/localhost:8787\/\.well-known\/oauth-protected-resource\/mcp"/);
+});
+
+await check("entitled customer: DCR + PKCE + sign-in + token exchange + MCP connect", async () => {
+  customer = await connect("Buyer@Example.com", "TEST-KEY-0001");
+  assert.equal(customer.result.status, 302, `sign-in redirected (got ${customer.result.status})`);
+  assert.ok(customer.client, "connected");
+});
+
+await check("entitled customer: tools listed with read-only annotations and oauth securitySchemes", async () => {
+  const { tools } = await customer.client.listTools();
+  assert.deepEqual(tools.map((t) => t.name).sort(), ["get_playbook", "read_document", "search_knowledge"]);
+  for (const t of tools) {
+    assert.deepEqual([t.annotations.readOnlyHint, t.annotations.destructiveHint, t.annotations.openWorldHint], [true, false, false]);
+  }
+});
+
+await check("entitled customer: get_playbook returns the GPT instructions", async () => {
+  const r = await customer.client.callTool({ name: "get_playbook", arguments: {} });
+  assert.equal(textOf(r), content.playbook);
+});
+
+await check("entitled customer: search_knowledge finds the right section", async () => {
+  const r = await customer.client.callTool({ name: "search_knowledge", arguments: { query: "flat loaf gummy crumb" } });
+  assert.match(textOf(r).split("\n---")[0], /Flat loaf, gummy crumb/);
+});
+
+await check("entitled customer: read_document returns one section verbatim", async () => {
+  const r = await customer.client.callTool({ name: "read_document", arguments: { doc: "troubleshooting-matrix", section: "Dense, tight crumb" } });
+  assert.match(textOf(r), /weak or young starter/);
+});
+
+for (const [label, email, key] of [
+  ["wrong key", "buyer@example.com", "TEST-KEY-9999"],
+  ["unknown email", "stranger@example.com", "TEST-KEY-0001"],
+]) {
+  await check(`non-entitled (${label}): no token, neutral message, no content, no upsell`, async () => {
+    const { result, client } = await connect(email, key);
+    assert.equal(client, undefined, "no MCP session");
+    assert.equal(result.status, 401);
+    assert.match(result.body, /do not match an active purchase/);
+    assert.doesNotMatch(result.body, UPSELL);
+    assert.doesNotMatch(result.page + result.body, UPSELL);
+    for (const chunk of content.chunks) assert.ok(!result.body.includes(chunk.text.slice(0, 60)), "no knowledge text");
+    assert.ok(!result.body.includes(content.playbook.slice(0, 60)), "no playbook text");
+  });
+}
+
+await check("revoked after sign-in: next tool call is denied neutrally with a re-auth challenge", async () => {
+  execFileSync("node", ["tools/customers.mjs", "revoke", "buyer@example.com", "--local"], { stdio: "ignore" });
+  const r = await customer.client.callTool({ name: "get_playbook", arguments: {} });
+  assert.equal(r.isError, true);
+  assert.match(textOf(r), /not linked to an active Crumb & Crust Studio purchase/);
+  assert.doesNotMatch(textOf(r), UPSELL);
+  assert.ok(!textOf(r).includes(content.playbook.slice(0, 60)));
+  assert.match(r._meta["mcp/www_authenticate"][0], /resource_metadata=/);
+});
+
+await check("reviewer-style account signs in with email + key only (no MFA, magic link or email code)", async () => {
+  execFileSync("node", ["tools/customers.mjs", "add", "reviewer@example.com", "--key", "REVIEW-KEY-0001", "--local"], { stdio: "ignore" });
+  const r = await connect("reviewer@example.com", "REVIEW-KEY-0001");
+  assert.equal(r.result.status, 302);
+  const tools = await r.client.listTools();
+  assert.equal(tools.tools.length, 3);
+});
+
+const failed = results.filter(([s]) => s === "FAIL").length;
+console.log(`\n${results.length - failed}/${results.length} passed`);
+process.exit(failed ? 1 : 0);
