@@ -123,7 +123,18 @@ const authorizePage = {
 let provider: OAuthProvider<Env> | undefined;
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // OAuth metadata and token audiences use PUBLIC_ORIGIN. Reached at any other origin,
+    // customers would sign in and then get 401 on every tool call (and domain verification
+    // would pass for a broken setup); say why instead.
+    const url = new URL(request.url);
+    if (url.origin !== env.PUBLIC_ORIGIN) {
+      return new Response(
+        `Setup error: PUBLIC_ORIGIN is "${env.PUBLIC_ORIGIN}" but this server was reached at "${url.origin}". ` +
+          `Set PUBLIC_ORIGIN in wrangler.jsonc to "${url.origin}" (no trailing slash), set mcpURL in gpt.json to "${url.origin}/mcp", then convert and deploy again.\n`,
+        { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } },
+      );
+    }
     provider ??= new OAuthProvider<Env>({
       apiRoute: "/mcp",
       apiHandler: McpApiHandler as any,

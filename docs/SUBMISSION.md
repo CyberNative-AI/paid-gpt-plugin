@@ -30,6 +30,11 @@ node tools/check-package.mjs build/<slug>-plugin.zip
 npx wrangler deploy
 node tools/customers.mjs import customers.csv    # prints email,key: send each customer their key
 ```
+Open your origin in a browser after each deploy. It should say "sign-in service for existing
+customers". A "Setup error" names the origin to put in `PUBLIC_ORIGIN` and `mcpURL`. If they
+differ from the address ChatGPT connects to, customers can sign in but every tool call fails.
+The first deploy prints your `workers.dev` address; if you didn't know it before, set it and
+deploy again.
 
 ## Untested: connecting OAuth on a plugin created from a ZIP
 No plugin built from this template has been uploaded to the plugin dashboard yet. Builders

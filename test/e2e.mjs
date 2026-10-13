@@ -94,7 +94,7 @@ await check("domain verification token served as exact plain text", async () => 
 await check("unauthenticated MCP request gets 401 with resource metadata", async () => {
   const r = await fetch(MCP, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
   assert.equal(r.status, 401);
-  assert.match(r.headers.get("www-authenticate"), /resource_metadata="http:\/\/localhost:8787\/\.well-known\/oauth-protected-resource\/mcp"/);
+  assert.ok(r.headers.get("www-authenticate").includes(`resource_metadata="${new URL("/.well-known/oauth-protected-resource/mcp", BASE).href}"`));
 });
 
 await check("entitled customer: DCR + PKCE + sign-in + token exchange + MCP connect", async () => {
