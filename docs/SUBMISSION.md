@@ -32,10 +32,15 @@ node tools/customers.mjs import customers.csv    # prints email,key: send each c
 ```
 
 ## Untested: connecting OAuth on a plugin created from a ZIP
-No plugin built from this template has been uploaded to the plugin dashboard yet. One builder
-on the OpenAI Developer Community (topic 1404710) reported on 2026-10-09 that plugins
-created from a ZIP showed "Authorization unavailable" and failed to connect with "OAuth
-client ID is required". The packages in that report declared no auth, or a client ID.
-`mcp.json` here declares DCR under `extensions.com.openai.auth`; whether the dashboard
-accepts that is unknown. Upload early, before you record the demo video, and confirm that
-**Connect** reaches your Worker's sign-in page.
+No plugin built from this template has been uploaded to the plugin dashboard yet. Builders
+on the OpenAI Developer Community (topic 1404710) report that plugins created from a ZIP
+fail to connect OAuth:
+- 2026-10-09: packages that declared no auth, or a client ID, showed "Authorization
+  unavailable" and failed with "OAuth client ID is required".
+- 2026-10-13: two packages that declared `extensions.com.openai.auth` with
+  `"client": { "mode": "cimd" }` failed with "OAuth client ID is required when using
+  pre-defined OAuth client credentials".
+
+`mcp.json` here uses the same field with `"mode": "dcr"`; whether the dashboard accepts that
+is unknown. Upload early, before you record the demo video, and confirm that **Connect**
+reaches your Worker's sign-in page.
